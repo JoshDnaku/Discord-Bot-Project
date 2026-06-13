@@ -2,6 +2,7 @@ import discord
 import os
 import random
 import asyncio
+import functools
 from dotenv import load_dotenv
 import yt_dlp
 from collections import deque
@@ -14,6 +15,7 @@ YDL_OPTIONS = {
     'format': 'bestaudio/best',       # Get the best audio quality available
     'noplaylist': True,                # Don't download entire playlists, just one video
     'quiet': True,                     # Don't spam terminal with logs
+    'no_warnings': True,               # Suppress warning messages
     'default_search': 'ytsearch',      # If input isn't a URL, search YouTube automatically
 }
 
@@ -35,6 +37,24 @@ def format_duration(seconds):
     return f'{minutes}:{secs:02d}'
 
 
+def search_youtube(query):
+    """Searches YouTube and returns song info. Runs in a thread so it doesn't block the bot."""
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(query, download=False)
+
+        if 'entries' in info:
+            if len(info['entries']) == 0:
+                return None
+            info = info['entries'][0]
+
+        return {
+            'url': info['url'],
+            'title': info.get('title', query),
+            'duration': info.get('duration', 0),
+            'requester': None
+        }
+
+
 class MusicBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,7 +73,6 @@ class MusicBot(discord.Client):
 
     def start_idle_timer(self):
         """Starts a 3-minute timer. If no song plays before it expires, bot leaves."""
-        # Cancel any existing idle timer
         if self.idle_timer:
             self.idle_timer.cancel()
 
@@ -78,25 +97,20 @@ class MusicBot(discord.Client):
 
     async def on_voice_state_update(self, member, before, after):
         """Fires when someone joins, leaves, or moves voice channels."""
-        # Only care if the bot is connected
         if not self.voice_client or not self.voice_client.is_connected():
             return
 
-        # Ignore the bot's own voice state changes
         if member == self.user:
             return
 
         bot_channel = self.voice_client.channel
 
-        # Check if the bot is now alone (only the bot in the channel)
-        # members includes the bot itself, so if count is 1, bot is alone
         if len(bot_channel.members) == 1:
-            # Start 30-second timer
             if self.alone_timer:
                 self.alone_timer.cancel()
 
             async def alone_disconnect():
-                await asyncio.sleep(30)  # Wait 30 seconds
+                await asyncio.sleep(30)
                 if self.voice_client and self.voice_client.is_connected():
                     if len(self.voice_client.channel.members) == 1:
                         if self.text_channel:
@@ -109,7 +123,6 @@ class MusicBot(discord.Client):
 
             self.alone_timer = asyncio.ensure_future(alone_disconnect())
         else:
-            # Someone is still here, cancel the alone timer
             if self.alone_timer:
                 self.alone_timer.cancel()
                 self.alone_timer = None
@@ -118,10 +131,9 @@ class MusicBot(discord.Client):
         """Called when a song finishes. Plays the next song in queue if there is one."""
         if error:
             print(f'Player error: {error}')
-            # Notify the text channel if there's an error
             if self.text_channel:
                 asyncio.ensure_future(
-                    self.text_channel.send(f'⚠️ Error playing song, skipping to next...')
+                    self.text_channel.send('⚠️ Error playing song, skipping to next...')
                 )
 
         # LOOP SONG: replay the same song again
@@ -143,7 +155,6 @@ class MusicBot(discord.Client):
         # If there's nothing left in the queue, we're done
         if len(self.queue) == 0:
             self.current_song = None
-            # Start idle timer since nothing is playing
             self.start_idle_timer()
             return
 
@@ -162,37 +173,30 @@ class MusicBot(discord.Client):
                 asyncio.ensure_future(
                     self.text_channel.send(f'⚠️ Error playing **{next_song["title"]}**, skipping...')
                 )
-            # Try the next song
             self.play_next()
 
     async def on_message(self, message):
         """Runs every time someone sends a message the bot can see."""
 
-        # Ignore messages from the bot itself (prevents infinite loops)
         if message.author == self.user:
             return
 
         # --- !play command ---
         if message.content.startswith('!play'):
-            # Get everything after "!play " as the search query
             query = message.content[5:].strip()
 
-            # Handle empty search
             if not query:
                 await message.channel.send("❌ You need to tell me what to play! Example: `!play lofi beats`")
                 return
 
-            # Store the text channel for auto-leave messages
             self.text_channel = message.channel
 
-            # Check if the user is in a voice channel
             if message.author.voice is None:
                 await message.channel.send("❌ You need to be in a voice channel!")
                 return
 
             voice_channel = message.author.voice.channel
 
-            # Connect to the voice channel (or move if already connected somewhere else)
             try:
                 if self.voice_client is None or not self.voice_client.is_connected():
                     self.voice_client = await voice_channel.connect()
@@ -202,52 +206,46 @@ class MusicBot(discord.Client):
                 await message.channel.send(f"❌ Couldn't connect to the voice channel: {e}")
                 return
 
-            # Use yt-dlp to search YouTube and get the audio URL
             await message.channel.send(f'🔎 Searching for: **{query}**')
 
+            # Run yt-dlp in a background thread so the bot doesn't freeze
             try:
-                with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-                    info = ydl.extract_info(query, download=False)
+                loop = asyncio.get_event_loop()
+                song_info = await loop.run_in_executor(
+                    None, functools.partial(search_youtube, query)
+                )
 
-                    # If it was a search, results are in 'entries' list — grab the first one
-                    if 'entries' in info:
-                        if len(info['entries']) == 0:
-                            await message.channel.send("❌ No results found for that search.")
-                            return
-                        info = info['entries'][0]
+                if song_info is None:
+                    await message.channel.send("❌ No results found for that search.")
+                    return
 
-                    # Store song info (url, title, duration, and who requested it)
-                    song = {
-                        'url': info['url'],
-                        'title': info.get('title', query),
-                        'duration': info.get('duration', 0),
-                        'requester': message.author.display_name
-                    }
+                song_info['requester'] = message.author.display_name
+
             except Exception as e:
-                await message.channel.send(f"❌ Couldn't find or load that song. Try a different search.")
+                await message.channel.send("❌ Couldn't find or load that song. Try a different search.")
                 print(f'yt-dlp error: {e}')
                 return
 
             # If something is already playing, add to queue
             if self.voice_client.is_playing() or self.voice_client.is_paused():
-                self.queue.append(song)
+                self.queue.append(song_info)
                 position = len(self.queue)
                 await message.channel.send(
-                    f'📋 Added to queue (#{position}): **{song["title"]}** [{format_duration(song["duration"])}]'
+                    f'📋 Added to queue (#{position}): **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
                 )
             else:
                 # Nothing is playing, start immediately
-                self.current_song = song
-                self.cancel_idle_timer()  # Cancel idle timer since we're playing
+                self.current_song = song_info
+                self.cancel_idle_timer()
                 try:
-                    source = discord.FFmpegPCMAudio(song['url'], **FFMPEG_OPTIONS)
+                    source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
                     source = discord.PCMVolumeTransformer(source, volume=self.volume)
                     self.voice_client.play(source, after=self.play_next)
                     await message.channel.send(
-                        f'🎵 Now playing: **{song["title"]}** [{format_duration(song["duration"])}]'
+                        f'🎵 Now playing: **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
                     )
                 except Exception as e:
-                    await message.channel.send(f"❌ Error playing that song. Try again or try a different one.")
+                    await message.channel.send("❌ Error playing that song. Try again or try a different one.")
                     print(f'Playback error: {e}')
                     self.current_song = None
 
@@ -257,7 +255,6 @@ class MusicBot(discord.Client):
                 await message.channel.send('Nothing is playing right now.')
             else:
                 song = self.current_song
-                # Show loop status in now playing
                 loop_status = ''
                 if self.loop_mode == 'song':
                     loop_status = '\n🔂 **Loop:** Song'
@@ -275,7 +272,7 @@ class MusicBot(discord.Client):
 
         # --- !loop command ---
         elif message.content.startswith('!loop'):
-            arg = message.content[5:].strip().lower()  # Get what's after "!loop"
+            arg = message.content[5:].strip().lower()
 
             if arg == 'song':
                 self.loop_mode = 'song'
@@ -287,7 +284,6 @@ class MusicBot(discord.Client):
                 self.loop_mode = 'off'
                 await message.channel.send('➡️ Loop is now **off**.')
             else:
-                # No argument or invalid — show current status
                 await message.channel.send(
                     f'Current loop mode: **{self.loop_mode}**\n'
                     f'Usage: `!loop song` / `!loop queue` / `!loop off`'
@@ -296,7 +292,7 @@ class MusicBot(discord.Client):
         # --- !skip command ---
         elif message.content == '!skip':
             if self.voice_client and self.voice_client.is_playing():
-                self.voice_client.stop()  # Stopping triggers play_next via the "after" callback
+                self.voice_client.stop()
                 await message.channel.send('⏭️ Skipped!')
             else:
                 await message.channel.send('Nothing is playing.')
@@ -318,8 +314,11 @@ class MusicBot(discord.Client):
 
             if len(self.queue) > 0:
                 queue_text += '**Up next:**\n'
-                for i, song in enumerate(self.queue, 1):
+                for i, song in enumerate(list(self.queue)[:15], 1):
                     queue_text += f'{i}. {song["title"]} [{format_duration(song["duration"])}] (requested by {song["requester"]})\n'
+
+                if len(self.queue) > 15:
+                    queue_text += f'\n*...and {len(self.queue) - 15} more songs.*'
             else:
                 queue_text += '*No more songs in queue.*'
 
@@ -328,9 +327,9 @@ class MusicBot(discord.Client):
         # --- !stop command ---
         elif message.content == '!stop':
             if self.voice_client:
-                self.queue.clear()         # Clear the entire queue
+                self.queue.clear()
                 self.current_song = None
-                self.voice_client.stop()   # Stop current playback
+                self.voice_client.stop()
                 await message.channel.send('⏹️ Stopped and cleared the queue.')
 
         # --- !pause command ---
@@ -348,7 +347,7 @@ class MusicBot(discord.Client):
         # --- !leave command ---
         elif message.content == '!leave':
             if self.voice_client and self.voice_client.is_connected():
-                self.queue.clear()         # Clear queue when leaving
+                self.queue.clear()
                 self.current_song = None
                 await self.voice_client.disconnect()
                 self.voice_client = None
@@ -379,7 +378,6 @@ class MusicBot(discord.Client):
                 await message.channel.send('Not enough songs in the queue to shuffle.')
                 return
 
-            # Convert deque to list, shuffle it, convert back
             queue_list = list(self.queue)
             random.shuffle(queue_list)
             self.queue = deque(queue_list)
@@ -388,29 +386,24 @@ class MusicBot(discord.Client):
 
         # --- !volume command ---
         elif message.content.startswith('!volume'):
-            arg = message.content[7:].strip()  # Get what's after "!volume"
+            arg = message.content[7:].strip()
 
-            # No argument — show current volume
             if not arg:
                 await message.channel.send(f'🔊 Current volume: **{int(self.volume * 100)}%**')
                 return
 
-            # Try to parse the number
             try:
                 vol = int(arg)
             except ValueError:
                 await message.channel.send('Use a number between 0 and 100. Example: `!volume 50`')
                 return
 
-            # Clamp between 0 and 100
             if vol < 0 or vol > 100:
                 await message.channel.send('Volume must be between 0 and 100.')
                 return
 
-            # Set the volume (convert 0-100 to 0.0-1.0)
             self.volume = vol / 100
 
-            # Apply to currently playing audio immediately
             if self.voice_client and self.voice_client.source:
                 self.voice_client.source.volume = self.volume
 
@@ -419,7 +412,8 @@ class MusicBot(discord.Client):
 
 # Set up intents (permissions for what events the bot receives)
 intents = discord.Intents.default()
-intents.message_content = True  # Required to read message text
+intents.message_content = True   # Required to read message text
+intents.voice_states = True      # Required for on_voice_state_update (auto-leave)
 
 # Create and run the bot
 client = MusicBot(intents=intents)
