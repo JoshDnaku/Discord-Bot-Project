@@ -1,0 +1,15 @@
+# Environment variables (contains your bot token - NEVER commit this)
+.env
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
