@@ -3,6 +3,7 @@ import os
 import random
 import asyncio
 import functools
+import logging
 from dotenv import load_dotenv
 from discord.ext import commands
 import yt_dlp
@@ -10,6 +11,14 @@ from collections import deque
 
 # Load the bot token from .env file
 load_dotenv()
+
+# Configure logging — outputs timestamp, log level, and message
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
 # yt-dlp options: we only want audio, not video
 YDL_OPTIONS = {
@@ -97,7 +106,7 @@ class MusicBot(commands.Bot):
     def play_next(self, error=None):
         """Called when a song finishes. Plays the next song in queue if there is one."""
         if error:
-            print(f'Player error: {error}')
+            logger.error(f'Player error: {error}')
             if self.text_channel:
                 asyncio.ensure_future(
                     self.text_channel.send('⚠️ Error playing song, skipping to next...')
@@ -110,7 +119,7 @@ class MusicBot(commands.Bot):
                 source = discord.PCMVolumeTransformer(source, volume=self.volume)
                 self.voice_client.play(source, after=self.play_next)
             except Exception as e:
-                print(f'Error replaying song: {e}')
+                logger.error(f'Error replaying song: {e}')
                 self.loop_mode = 'off'
                 self.play_next()
             return
@@ -135,7 +144,7 @@ class MusicBot(commands.Bot):
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
             self.voice_client.play(source, after=self.play_next)
         except Exception as e:
-            print(f'Error playing next song: {e}')
+            logger.error(f'Error playing next song: {e}')
             if self.text_channel:
                 asyncio.ensure_future(
                     self.text_channel.send(f'⚠️ Error playing **{next_song["title"]}**, skipping...')
@@ -155,7 +164,7 @@ bot = MusicBot(command_prefix='!', intents=intents, help_command=None)
 @bot.event
 async def on_ready():
     """Runs when the bot successfully connects to Discord."""
-    print(f'Logged on as {bot.user}!')
+    logger.info(f'Logged on as {bot.user}!')
 
 
 @bot.event
@@ -236,7 +245,7 @@ async def play(ctx, *, query: str = ''):
 
     except Exception as e:
         await ctx.send("❌ Couldn't find or load that song. Try a different search.")
-        print(f'yt-dlp error: {e}')
+        logger.error(f'yt-dlp error: {e}')
         return
 
     # If something is already playing, add to queue
@@ -259,7 +268,7 @@ async def play(ctx, *, query: str = ''):
             )
         except Exception as e:
             await ctx.send("❌ Error playing that song. Try again or try a different one.")
-            print(f'Playback error: {e}')
+            logger.error(f'Playback error: {e}')
             bot.current_song = None
 
 
