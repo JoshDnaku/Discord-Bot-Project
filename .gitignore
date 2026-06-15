@@ -9,8 +9,13 @@ __pycache__/
 # Virtual environment
 venv/
 .venv/
-venv312
+venv_new/
+venv312/
 
 # IDE files
 .vscode/
 .idea/
+
+# Debug logs
+ffmpeg_debug.log
+*.log

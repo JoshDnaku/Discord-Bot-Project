@@ -29,13 +29,19 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------
 
 YDL_OPTIONS = {
-    # m4a is usually more stable for Discord/FFmpeg than some webm/opus streams
-    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    # Use the Android player client — it returns audio URLs without YouTube's
+    # session-locking that causes 403 errors when FFmpeg tries to fetch them.
+    'format': 'bestaudio/best',
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
     'cachedir': False,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android'],
+        }
+    },
 }
 
 FFMPEG_OPTIONS = {
@@ -49,6 +55,16 @@ FFMPEG_OPTIONS = {
     ),
     'options': '-vn'
 }
+
+
+def build_ffmpeg_options(http_headers):
+    """Build FFmpeg options including HTTP headers required by YouTube to avoid 403."""
+    opts = dict(FFMPEG_OPTIONS)
+    if http_headers:
+        # Format headers as "Key: Value\r\n" lines for FFmpeg
+        header_lines = ''.join(f'{k}: {v}\\r\\n' for k, v in http_headers.items())
+        opts['before_options'] = f'{opts["before_options"]} -headers "{header_lines}"'
+    return opts
 
 IDLE_LEAVE_SECONDS = 180
 ALONE_LEAVE_SECONDS = 30
@@ -108,6 +124,7 @@ def search_youtube(query):
                 'title': info.get('title', query),
                 'duration': info.get('duration', 0),
                 'requester': None,
+                'http_headers': info.get('http_headers') or {},
             }
 
     except Exception as e:
@@ -328,9 +345,10 @@ class MusicBot(commands.Bot):
                 # LOOP SONG: replay same song
                 if state.loop_mode == 'song' and state.current_song:
                     try:
+                        ffmpeg_opts = build_ffmpeg_options(state.current_song.get('http_headers'))
                         source = discord.FFmpegPCMAudio(
                             state.current_song['url'],
-                            **FFMPEG_OPTIONS
+                            **ffmpeg_opts
                         )
                         source = discord.PCMVolumeTransformer(source, volume=state.volume)
 
@@ -365,9 +383,10 @@ class MusicBot(commands.Bot):
             state.current_song = next_song
 
             try:
+                ffmpeg_opts = build_ffmpeg_options(next_song.get('http_headers'))
                 source = discord.FFmpegPCMAudio(
                     next_song['url'],
-                    **FFMPEG_OPTIONS
+                    **ffmpeg_opts
                 )
                 source = discord.PCMVolumeTransformer(source, volume=state.volume)
 
@@ -552,7 +571,7 @@ async def play(ctx, *, query: str = ''):
 
         try:
             if state.voice_client is None or not state.voice_client.is_connected():
-                state.voice_client = await voice_channel.connect()
+                state.voice_client = await voice_channel.connect(timeout=60.0, reconnect=True)
             elif state.voice_client.channel != voice_channel:
                 await state.voice_client.move_to(voice_channel)
 
@@ -595,7 +614,8 @@ async def play(ctx, *, query: str = ''):
         state.skip_requested = False
 
         try:
-            source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
+            ffmpeg_opts = build_ffmpeg_options(song_info.get('http_headers'))
+            source = discord.FFmpegPCMAudio(song_info['url'], **ffmpeg_opts)
             source = discord.PCMVolumeTransformer(source, volume=state.volume)
 
             state.voice_client.play(
