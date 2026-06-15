@@ -4,6 +4,7 @@ import random
 import asyncio
 import functools
 import logging
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from discord.ext import commands
 import yt_dlp
@@ -581,6 +582,14 @@ async def play(ctx, *, query: str = ''):
             return await ctx.send(f"❌ Couldn't connect to the voice channel: {e}")
 
         await ctx.send(f'🔎 Searching for: **{query}**')
+
+        # Security: only allow YouTube URLs. Reject other sites to prevent abuse,
+        # since yt-dlp supports hundreds of extractors we don't want exposed.
+        if query.startswith('http://') or query.startswith('https://'):
+            parsed = urlparse(query)
+            allowed_domains = {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'}
+            if parsed.hostname and parsed.hostname.lower() not in allowed_domains:
+                return await ctx.send('❌ Only YouTube links are supported.')
 
         try:
             loop = asyncio.get_running_loop()

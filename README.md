@@ -163,6 +163,10 @@ Discord-Bot-Project/
 
 ## Important Notes
 
+### Only YouTube is supported
+
+The bot only accepts YouTube searches and YouTube URLs (`youtube.com`, `youtu.be`). Links from other sites (Spotify, SoundCloud, etc.) will be rejected.
+
 ### discord.py voice extras are required
 
 The `[voice]` extra installs PyNaCl and other voice dependencies. Without it, the bot will fail to join voice channels.
