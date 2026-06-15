@@ -65,11 +65,12 @@ def search_youtube(query):
         }
 
 
-class MusicBot(commands.Bot):
-    """Subclass of commands.Bot that holds all the music state on the bot itself."""
+class MusicState:
+    """Holds all music-related state for a single guild (server).
+    Each guild gets its own MusicState instance so multiple servers
+    can use the bot simultaneously without stepping on each other."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self):
         self.voice_client = None       # Tracks the current voice connection
         self.queue = deque()           # The song queue — songs waiting to play
         self.current_song = None       # Info about what's currently playing
@@ -78,6 +79,21 @@ class MusicBot(commands.Bot):
         self.idle_timer = None         # Timer for auto-leave when idle
         self.alone_timer = None        # Timer for auto-leave when alone in channel
         self.text_channel = None       # Store last text channel for auto-leave messages
+
+
+class MusicBot(commands.Bot):
+    """Subclass of commands.Bot that holds all the music state on the bot itself."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-guild music state. Key = guild_id, value = MusicState instance.
+        self.music_states = {}
+
+    def get_state(self, guild_id):
+        """Return the MusicState for a guild, creating one if it doesn't exist yet."""
+        if guild_id not in self.music_states:
+            self.music_states[guild_id] = MusicState()
+        return self.music_states[guild_id]
 
     def start_idle_timer(self):
         """Starts a 3-minute timer. If no song plays before it expires, bot leaves."""
