@@ -95,29 +95,33 @@ class MusicBot(commands.Bot):
             self.music_states[guild_id] = MusicState()
         return self.music_states[guild_id]
 
-    def start_idle_timer(self):
+    def start_idle_timer(self, guild_id):
         """Starts a 3-minute timer. If no song plays before it expires, bot leaves."""
-        if self.idle_timer:
-            self.idle_timer.cancel()
+        state = self.get_state(guild_id)
+
+        # Cancel any existing idle timer
+        if state.idle_timer:
+            state.idle_timer.cancel()
 
         async def idle_disconnect():
             await asyncio.sleep(180)  # Wait 3 minutes
-            if self.voice_client and self.voice_client.is_connected():
-                if not self.voice_client.is_playing() and not self.voice_client.is_paused():
-                    if self.text_channel:
-                        await self.text_channel.send('👋 Left the voice channel (idle for 3 minutes).')
-                    await self.voice_client.disconnect()
-                    self.voice_client = None
-                    self.queue.clear()
-                    self.current_song = None
+            if state.voice_client and state.voice_client.is_connected():
+                if not state.voice_client.is_playing() and not state.voice_client.is_paused():
+                    if state.text_channel:
+                        await state.text_channel.send('👋 Left the voice channel (idle for 3 minutes).')
+                    await state.voice_client.disconnect()
+                    state.voice_client = None
+                    state.queue.clear()
+                    state.current_song = None
 
-        self.idle_timer = asyncio.ensure_future(idle_disconnect())
+        state.idle_timer = asyncio.ensure_future(idle_disconnect())
 
-    def cancel_idle_timer(self):
+    def cancel_idle_timer(self, guild_id):
         """Cancels the idle timer (called when a new song starts playing)."""
-        if self.idle_timer:
-            self.idle_timer.cancel()
-            self.idle_timer = None
+        state = self.get_state(guild_id)
+        if state.idle_timer:
+            state.idle_timer.cancel()
+            state.idle_timer = None
 
     def play_next(self, error=None):
         """Called when a song finishes. Plays the next song in queue if there is one."""
@@ -221,13 +225,14 @@ async def on_voice_state_update(member, before, after):
 @bot.command(name='play')
 async def play(ctx, *, query: str = ''):
     """Search YouTube and play a song. Adds to queue if something is already playing."""
+    state = bot.get_state(ctx.guild.id)
     query = query.strip()
 
     if not query:
         await ctx.send("❌ You need to tell me what to play! Example: `!play lofi beats`")
         return
 
-    bot.text_channel = ctx.channel
+    state.text_channel = ctx.channel
 
     if ctx.author.voice is None:
         await ctx.send("❌ You need to be in a voice channel!")
@@ -236,10 +241,10 @@ async def play(ctx, *, query: str = ''):
     voice_channel = ctx.author.voice.channel
 
     try:
-        if bot.voice_client is None or not bot.voice_client.is_connected():
-            bot.voice_client = await voice_channel.connect()
-        elif bot.voice_client.channel != voice_channel:
-            await bot.voice_client.move_to(voice_channel)
+        if state.voice_client is None or not state.voice_client.is_connected():
+            state.voice_client = await voice_channel.connect()
+        elif state.voice_client.channel != voice_channel:
+            await state.voice_client.move_to(voice_channel)
     except Exception as e:
         await ctx.send(f"❌ Couldn't connect to the voice channel: {e}")
         return
@@ -265,27 +270,27 @@ async def play(ctx, *, query: str = ''):
         return
 
     # If something is already playing, add to queue
-    if bot.voice_client.is_playing() or bot.voice_client.is_paused():
-        bot.queue.append(song_info)
-        position = len(bot.queue)
+    if state.voice_client.is_playing() or state.voice_client.is_paused():
+        state.queue.append(song_info)
+        position = len(state.queue)
         await ctx.send(
             f'📋 Added to queue (#{position}): **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
         )
     else:
         # Nothing is playing, start immediately
-        bot.current_song = song_info
-        bot.cancel_idle_timer()
+        state.current_song = song_info
+        bot.cancel_idle_timer(ctx.guild.id)
         try:
             source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
-            source = discord.PCMVolumeTransformer(source, volume=bot.volume)
-            bot.voice_client.play(source, after=bot.play_next)
+            source = discord.PCMVolumeTransformer(source, volume=state.volume)
+            state.voice_client.play(source, after=bot.play_next)
             await ctx.send(
                 f'🎵 Now playing: **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
             )
         except Exception as e:
             await ctx.send("❌ Error playing that song. Try again or try a different one.")
             logger.error(f'Playback error: {e}')
-            bot.current_song = None
+            state.current_song = None
 
 
 # --- !np (now playing) command ---
