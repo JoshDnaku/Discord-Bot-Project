@@ -37,6 +37,7 @@ YDL_OPTIONS = {
     'no_warnings': True,
     'default_search': 'ytsearch',
     'cachedir': False,
+    'socket_timeout': 20,
     'extractor_args': {
         'youtube': {
             'player_client': ['android'],
@@ -584,9 +585,12 @@ async def play(ctx, *, query: str = ''):
         try:
             loop = asyncio.get_running_loop()
 
-            song_info = await loop.run_in_executor(
-                None,
-                functools.partial(search_youtube, query)
+            song_info = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    functools.partial(search_youtube, query)
+                ),
+                timeout=25
             )
 
             if song_info is None:
@@ -594,6 +598,8 @@ async def play(ctx, *, query: str = ''):
 
             song_info['requester'] = ctx.author.display_name
 
+        except asyncio.TimeoutError:
+            return await ctx.send('❌ Search timed out. YouTube might be slow, try again.')
         except Exception as e:
             logger.exception(f'yt-dlp error: {e}')
             return await ctx.send("❌ Couldn't find or load that song. Try a different search.")
