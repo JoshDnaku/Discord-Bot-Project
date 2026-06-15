@@ -12,449 +12,898 @@ from collections import deque
 # Load the bot token from .env file
 load_dotenv()
 
-# Configure logging — outputs timestamp, log level, and message
+# -------------------------------------------------
+# LOGGING SETUP
+# -------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
+
 logger = logging.getLogger(__name__)
 
-# yt-dlp options: we only want audio, not video
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
+
 YDL_OPTIONS = {
-    'format': 'bestaudio/best',       # Get the best audio quality available
-    'noplaylist': True,                # Don't download entire playlists, just one video
-    'quiet': True,                     # Don't spam terminal with logs
-    'no_warnings': True,               # Suppress warning messages
-    'default_search': 'ytsearch',      # If input isn't a URL, search YouTube automatically
+    # m4a is usually more stable for Discord/FFmpeg than some webm/opus streams
+    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    'noplaylist': True,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'ytsearch',
+    'cachedir': False,
 }
 
-# FFmpeg options: reconnect settings help if the stream drops briefly
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'  # -vn means "no video", only process audio
+    'before_options': (
+        '-nostdin '
+        '-reconnect 1 '
+        '-reconnect_streamed 1 '
+        '-reconnect_at_eof 1 '
+        '-reconnect_on_network_error 1 '
+        '-reconnect_delay_max 10'
+    ),
+    'options': '-vn'
 }
 
+IDLE_LEAVE_SECONDS = 180
+ALONE_LEAVE_SECONDS = 30
+
+
+# -------------------------------------------------
+# HELPERS
+# -------------------------------------------------
 
 def format_duration(seconds):
     """Converts seconds into a nice mm:ss or hh:mm:ss format."""
-    if not seconds:
+    try:
+        if not seconds:
+            return 'Unknown'
+
+        minutes, secs = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+
+        if hours > 0:
+            return f'{hours}:{minutes:02d}:{secs:02d}'
+
+        return f'{minutes}:{secs:02d}'
+
+    except Exception as e:
+        logger.exception(f'format_duration error: {e}')
         return 'Unknown'
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f'{hours}:{minutes:02d}:{secs:02d}'
-    return f'{minutes}:{secs:02d}'
 
 
 def search_youtube(query):
-    """Searches YouTube and returns song info. Runs in a thread so it doesn't block the bot."""
-    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-        info = ydl.extract_info(query, download=False)
+    """Searches YouTube and returns song info. Runs in a thread so it does not block the bot."""
+    try:
+        if not query or not query.strip():
+            return None
 
-        if 'entries' in info:
-            if len(info['entries']) == 0:
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = ydl.extract_info(query, download=False)
+
+            if not info:
                 return None
-            info = info['entries'][0]
 
-        return {
-            'url': info['url'],
-            'title': info.get('title', query),
-            'duration': info.get('duration', 0),
-            'requester': None
-        }
+            if 'entries' in info:
+                entries = info.get('entries') or []
 
+                if len(entries) == 0:
+                    return None
+
+                info = entries[0]
+
+            url = info.get('url')
+
+            if not url:
+                logger.error('yt-dlp did not return a playable URL.')
+                return None
+
+            return {
+                'url': url,
+                'title': info.get('title', query),
+                'duration': info.get('duration', 0),
+                'requester': None,
+            }
+
+    except Exception as e:
+        logger.exception(f'yt-dlp search error: {e}')
+        return None
+
+
+def get_human_user_ids_in_channel(guild, channel, bot_user_id):
+    """
+    Safer human detection for voice channels.
+
+    We avoid relying only on len(channel.members), because during voice leave/move
+    events Discord cache can briefly look wrong.
+    """
+    human_user_ids = set()
+
+    # Primary source: guild.voice_states
+    voice_states = getattr(guild, 'voice_states', {}) or {}
+
+    for user_id, voice_state in voice_states.items():
+        if user_id == bot_user_id:
+            continue
+
+        if not voice_state.channel:
+            continue
+
+        if voice_state.channel.id != channel.id:
+            continue
+
+        guild_member = guild.get_member(user_id)
+
+        if guild_member and guild_member.bot:
+            continue
+
+        human_user_ids.add(user_id)
+
+    # Fallback source: channel.members
+    # This prevents false "alone" detection if voice_states is temporarily incomplete.
+    for guild_member in getattr(channel, 'members', []):
+        if guild_member.id == bot_user_id:
+            continue
+
+        if guild_member.bot:
+            continue
+
+        human_user_ids.add(guild_member.id)
+
+    return list(human_user_ids)
+
+
+# -------------------------------------------------
+# MUSIC STATE
+# -------------------------------------------------
 
 class MusicState:
-    """Holds all music-related state for a single guild (server).
-    Each guild gets its own MusicState instance so multiple servers
-    can use the bot simultaneously without stepping on each other."""
+    """Holds all music-related state for a single Discord server."""
 
     def __init__(self):
-        self.voice_client = None       # Tracks the current voice connection
-        self.queue = deque()           # The song queue — songs waiting to play
-        self.current_song = None       # Info about what's currently playing
-        self.loop_mode = 'off'         # Loop mode: 'off', 'song', or 'queue'
-        self.volume = 0.5              # Default volume (50%)
-        self.idle_timer = None         # Timer for auto-leave when idle
-        self.alone_timer = None        # Timer for auto-leave when alone in channel
-        self.text_channel = None       # Store last text channel for auto-leave messages
+        self.voice_client = None
+        self.queue = deque()
+        self.current_song = None
+        self.loop_mode = 'off'
+        self.volume = 0.5
+        self.idle_timer = None
+        self.alone_timer = None
+        self.text_channel = None
+
+        # Prevents stop/skip from accidentally triggering loop replay or Queue ended spam
+        self.stop_requested = False
+        self.skip_requested = False
 
 
 class MusicBot(commands.Bot):
-    """Subclass of commands.Bot that holds all the music state on the bot itself."""
+    """Bot subclass with per-guild music states."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Per-guild music state. Key = guild_id, value = MusicState instance.
+
         self.music_states = {}
-        # Reference to the main asyncio event loop. Captured in on_ready so that
-        # callbacks running in Discord's audio thread can schedule coroutines
-        # back onto the main loop in a thread-safe way.
         self.loop_ref = None
 
     def get_state(self, guild_id):
-        """Return the MusicState for a guild, creating one if it doesn't exist yet."""
+        """Return the MusicState for a guild, creating one if it does not exist."""
+        if guild_id is None:
+            raise ValueError('guild_id cannot be None. Music commands must be used inside a server.')
+
         if guild_id not in self.music_states:
             self.music_states[guild_id] = MusicState()
+
         return self.music_states[guild_id]
 
-    def start_idle_timer(self, guild_id):
-        """Starts a 3-minute timer. If no song plays before it expires, bot leaves."""
-        state = self.get_state(guild_id)
+    def run_threadsafe(self, coro):
+        """Safely run a coroutine from Discord audio callback threads."""
+        try:
+            if self.loop_ref and not self.loop_ref.is_closed():
+                return asyncio.run_coroutine_threadsafe(coro, self.loop_ref)
 
-        # Cancel any existing idle timer
-        if state.idle_timer:
-            state.idle_timer.cancel()
+            logger.error('Cannot schedule coroutine: bot loop is not ready.')
 
-        async def idle_disconnect():
-            await asyncio.sleep(180)  # Wait 3 minutes
-            if state.voice_client and state.voice_client.is_connected():
-                if not state.voice_client.is_playing() and not state.voice_client.is_paused():
-                    if state.text_channel:
-                        await state.text_channel.send('👋 Left the voice channel (idle for 3 minutes).')
-                    await state.voice_client.disconnect()
-                    state.voice_client = None
-                    state.queue.clear()
-                    state.current_song = None
+            if hasattr(coro, 'close'):
+                coro.close()
 
-        # Schedule on the main event loop in a thread-safe way. start_idle_timer can be
-        # invoked from play_next, which runs in Discord's audio thread — so we cannot
-        # use asyncio.ensure_future here (it requires a running loop in the current thread).
-        state.idle_timer = asyncio.run_coroutine_threadsafe(idle_disconnect(), self.loop_ref)
+            return None
+
+        except Exception as e:
+            logger.exception(f'run_threadsafe error: {e}')
+
+            if hasattr(coro, 'close'):
+                coro.close()
+
+            return None
 
     def cancel_idle_timer(self, guild_id):
-        """Cancels the idle timer (called when a new song starts playing)."""
-        state = self.get_state(guild_id)
-        if state.idle_timer:
-            state.idle_timer.cancel()
-            state.idle_timer = None
+        """Cancels the idle timer for a guild."""
+        try:
+            state = self.get_state(guild_id)
+
+            if state.idle_timer:
+                state.idle_timer.cancel()
+                state.idle_timer = None
+
+        except Exception as e:
+            logger.exception(f'cancel_idle_timer error: {e}')
+
+    def cancel_alone_timer(self, guild_id):
+        """Cancels the alone timer for a guild."""
+        try:
+            state = self.get_state(guild_id)
+
+            if state.alone_timer:
+                state.alone_timer.cancel()
+                state.alone_timer = None
+
+        except Exception as e:
+            logger.exception(f'cancel_alone_timer error: {e}')
+
+    def start_idle_timer(self, guild_id):
+        """Starts a timer. If no song plays before it expires, bot leaves."""
+        try:
+            state = self.get_state(guild_id)
+
+            if state.idle_timer:
+                state.idle_timer.cancel()
+                state.idle_timer = None
+
+            async def idle_disconnect():
+                try:
+                    await asyncio.sleep(IDLE_LEAVE_SECONDS)
+
+                    current_state = self.get_state(guild_id)
+                    voice_client = current_state.voice_client
+
+                    if not voice_client or not voice_client.is_connected():
+                        return
+
+                    if voice_client.is_playing() or voice_client.is_paused():
+                        return
+
+                    if current_state.text_channel:
+                        await current_state.text_channel.send(
+                            f'👋 Left the voice channel (idle for {IDLE_LEAVE_SECONDS // 60} minutes).'
+                        )
+
+                    await voice_client.disconnect(force=True)
+
+                    current_state.voice_client = None
+                    current_state.queue.clear()
+                    current_state.current_song = None
+                    current_state.stop_requested = False
+                    current_state.skip_requested = False
+
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.exception(f'idle_disconnect error: {e}')
+
+            if self.loop_ref and not self.loop_ref.is_closed():
+                state.idle_timer = asyncio.run_coroutine_threadsafe(idle_disconnect(), self.loop_ref)
+            else:
+                logger.error('Cannot start idle timer: bot loop is not ready.')
+
+        except Exception as e:
+            logger.exception(f'start_idle_timer error: {e}')
 
     def play_next(self, guild_id, error=None):
         """Called when a song finishes. Plays the next song in queue if there is one."""
-        state = self.get_state(guild_id)
-
-        if error:
-            logger.error(f'Player error: {error}')
-            if state.text_channel:
-                # play_next runs in Discord's audio thread, so we must schedule
-                # the message send onto the main event loop in a thread-safe way.
-                asyncio.run_coroutine_threadsafe(
-                    state.text_channel.send('⚠️ Error playing song, skipping to next...'),
-                    self.loop_ref
-                )
-
-        # LOOP SONG: replay the same song again
-        if state.loop_mode == 'song' and state.current_song:
-            try:
-                source = discord.FFmpegPCMAudio(state.current_song['url'], **FFMPEG_OPTIONS)
-                source = discord.PCMVolumeTransformer(source, volume=state.volume)
-                state.voice_client.play(source, after=lambda e: self.play_next(guild_id, e))
-            except Exception as e:
-                logger.error(f'Error replaying song: {e}')
-                state.loop_mode = 'off'
-                self.play_next(guild_id)
-            return
-
-        # LOOP QUEUE: put the song that just finished back at the end of the queue
-        if state.loop_mode == 'queue' and state.current_song:
-            state.queue.append(state.current_song)
-
-        # If there's nothing left in the queue, we're done
-        if len(state.queue) == 0:
-            state.current_song = None
-            self.start_idle_timer(guild_id)
-            return
-
-        # Grab the next song from the front of the queue
-        next_song = state.queue.popleft()
-        state.current_song = next_song
-
-        # Play it, and when THIS song finishes, call play_next again
         try:
-            source = discord.FFmpegPCMAudio(next_song['url'], **FFMPEG_OPTIONS)
-            source = discord.PCMVolumeTransformer(source, volume=state.volume)
-            state.voice_client.play(source, after=lambda e: self.play_next(guild_id, e))
-        except Exception as e:
-            logger.error(f'Error playing next song: {e}')
-            if state.text_channel:
-                # play_next runs in Discord's audio thread, so we must schedule
-                # the message send onto the main event loop in a thread-safe way.
-                asyncio.run_coroutine_threadsafe(
-                    state.text_channel.send(f'⚠️ Error playing **{next_song["title"]}**, skipping...'),
-                    self.loop_ref
+            state = self.get_state(guild_id)
+
+            if error:
+                logger.error(f'Player error: {error}')
+
+                if state.text_channel:
+                    self.run_threadsafe(
+                        state.text_channel.send('⚠️ Error playing song, checking the queue...')
+                    )
+
+            # If !stop triggered this callback, do nothing
+            if state.stop_requested:
+                state.stop_requested = False
+                state.skip_requested = False
+                return
+
+            if not state.voice_client:
+                logger.warning('play_next called but no voice client exists.')
+                return
+
+            if not state.voice_client.is_connected():
+                logger.warning('play_next called but voice client is disconnected.')
+                return
+
+            # If !skip triggered this callback, do not loop/re-add the skipped song
+            if state.skip_requested:
+                state.skip_requested = False
+                state.current_song = None
+
+            else:
+                # LOOP SONG: replay same song
+                if state.loop_mode == 'song' and state.current_song:
+                    try:
+                        source = discord.FFmpegPCMAudio(
+                            state.current_song['url'],
+                            **FFMPEG_OPTIONS
+                        )
+                        source = discord.PCMVolumeTransformer(source, volume=state.volume)
+
+                        state.voice_client.play(
+                            source,
+                            after=lambda e: self.play_next(guild_id, e)
+                        )
+
+                        return
+
+                    except Exception as e:
+                        logger.exception(f'Error replaying song: {e}')
+                        state.loop_mode = 'off'
+
+                        if state.text_channel:
+                            self.run_threadsafe(
+                                state.text_channel.send('⚠️ Loop failed, disabling song loop.')
+                            )
+
+                # LOOP QUEUE: put finished song back at the end
+                if state.loop_mode == 'queue' and state.current_song:
+                    state.queue.append(state.current_song)
+
+            # Queue is empty
+            if len(state.queue) == 0:
+                state.current_song = None
+                self.start_idle_timer(guild_id)
+                return
+
+            # Play next queued song
+            next_song = state.queue.popleft()
+            state.current_song = next_song
+
+            try:
+                source = discord.FFmpegPCMAudio(
+                    next_song['url'],
+                    **FFMPEG_OPTIONS
                 )
-            self.play_next(guild_id)
+                source = discord.PCMVolumeTransformer(source, volume=state.volume)
+
+                state.voice_client.play(
+                    source,
+                    after=lambda e: self.play_next(guild_id, e)
+                )
+
+                if state.text_channel:
+                    self.run_threadsafe(
+                        state.text_channel.send(
+                            f'🎵 Now playing: **{next_song["title"]}** '
+                            f'[{format_duration(next_song["duration"])}]'
+                        )
+                    )
+
+            except Exception as e:
+                logger.exception(f'Error playing next song: {e}')
+
+                if state.text_channel:
+                    self.run_threadsafe(
+                        state.text_channel.send(
+                            f'⚠️ Error playing **{next_song["title"]}**, skipping...'
+                        )
+                    )
+
+                state.current_song = None
+                self.play_next(guild_id)
+
+        except Exception as e:
+            logger.exception(f'play_next fatal error: {e}')
 
 
-# Set up intents (permissions for what events the bot receives)
+# -------------------------------------------------
+# BOT SETUP
+# -------------------------------------------------
+
 intents = discord.Intents.default()
-intents.message_content = True   # Required to read message text
-intents.voice_states = True      # Required for on_voice_state_update (auto-leave)
+intents.message_content = True
+intents.voice_states = True
 
-# Create the bot — disable the default !help so our custom one works
 bot = MusicBot(command_prefix='!', intents=intents, help_command=None)
 
+
+# -------------------------------------------------
+# EVENTS
+# -------------------------------------------------
 
 @bot.event
 async def on_ready():
     """Runs when the bot successfully connects to Discord."""
-    # Capture the running event loop so audio-thread callbacks can schedule
-    # coroutines back onto it via asyncio.run_coroutine_threadsafe.
     bot.loop_ref = asyncio.get_running_loop()
     logger.info(f'Logged on as {bot.user}!')
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Fires when someone joins, leaves, or moves voice channels."""
-    if not bot.voice_client or not bot.voice_client.is_connected():
-        return
+    """Auto-leave only when there are ZERO real human users left in the bot's voice channel."""
+    try:
+        if member == bot.user:
+            return
 
-    if member == bot.user:
-        return
+        if not member.guild:
+            return
 
-    bot_channel = bot.voice_client.channel
+        state = bot.get_state(member.guild.id)
 
-    if len(bot_channel.members) == 1:
-        if bot.alone_timer:
-            bot.alone_timer.cancel()
+        if not state.voice_client or not state.voice_client.is_connected():
+            return
+
+        bot_channel = state.voice_client.channel
+
+        if not bot_channel:
+            return
+
+        human_user_ids = get_human_user_ids_in_channel(
+            member.guild,
+            bot_channel,
+            bot.user.id
+        )
+
+        logger.info(
+            'Voice check: channel=%s humans=%s cached_members=%s',
+            bot_channel.name,
+            human_user_ids,
+            [m.id for m in getattr(bot_channel, 'members', [])]
+        )
+
+        # If at least one real human is still there, do NOT leave.
+        if len(human_user_ids) > 0:
+            bot.cancel_alone_timer(member.guild.id)
+            return
+
+        # No humans detected. Start delayed leave.
+        bot.cancel_alone_timer(member.guild.id)
 
         async def alone_disconnect():
-            await asyncio.sleep(30)
-            if bot.voice_client and bot.voice_client.is_connected():
-                if len(bot.voice_client.channel.members) == 1:
-                    if bot.text_channel:
-                        await bot.text_channel.send('👋 Left the voice channel (nobody else here).')
-                    bot.voice_client.stop()
-                    await bot.voice_client.disconnect()
-                    bot.voice_client = None
-                    bot.queue.clear()
-                    bot.current_song = None
+            try:
+                await asyncio.sleep(ALONE_LEAVE_SECONDS)
 
-        bot.alone_timer = asyncio.ensure_future(alone_disconnect())
-    else:
-        if bot.alone_timer:
-            bot.alone_timer.cancel()
-            bot.alone_timer = None
+                current_state = bot.get_state(member.guild.id)
+
+                if not current_state.voice_client or not current_state.voice_client.is_connected():
+                    return
+
+                current_channel = current_state.voice_client.channel
+
+                if not current_channel:
+                    return
+
+                # Recheck after delay.
+                remaining_humans = get_human_user_ids_in_channel(
+                    member.guild,
+                    current_channel,
+                    bot.user.id
+                )
+
+                logger.info(
+                    'Alone timer recheck: channel=%s remaining_humans=%s cached_members=%s',
+                    current_channel.name,
+                    remaining_humans,
+                    [m.id for m in getattr(current_channel, 'members', [])]
+                )
+
+                # Someone is still there, so stay.
+                if len(remaining_humans) > 0:
+                    return
+
+                if current_state.text_channel:
+                    await current_state.text_channel.send(
+                        f'👋 Left the voice channel (nobody else here for {ALONE_LEAVE_SECONDS} seconds).'
+                    )
+
+                current_state.stop_requested = True
+                current_state.queue.clear()
+                current_state.current_song = None
+
+                if current_state.voice_client.is_playing() or current_state.voice_client.is_paused():
+                    current_state.voice_client.stop()
+
+                await current_state.voice_client.disconnect(force=True)
+                current_state.voice_client = None
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.exception(f'alone_disconnect error: {e}')
+
+        state.alone_timer = asyncio.create_task(alone_disconnect())
+
+    except Exception as e:
+        logger.exception(f'on_voice_state_update error: {e}')
 
 
-# --- !play command ---
+# -------------------------------------------------
+# COMMANDS
+# -------------------------------------------------
+
 @bot.command(name='play')
 async def play(ctx, *, query: str = ''):
     """Search YouTube and play a song. Adds to queue if something is already playing."""
-    state = bot.get_state(ctx.guild.id)
-    query = query.strip()
-
-    if not query:
-        await ctx.send("❌ You need to tell me what to play! Example: `!play lofi beats`")
-        return
-
-    state.text_channel = ctx.channel
-
-    if ctx.author.voice is None:
-        await ctx.send("❌ You need to be in a voice channel!")
-        return
-
-    voice_channel = ctx.author.voice.channel
-
     try:
-        if state.voice_client is None or not state.voice_client.is_connected():
-            state.voice_client = await voice_channel.connect()
-        elif state.voice_client.channel != voice_channel:
-            await state.voice_client.move_to(voice_channel)
-    except Exception as e:
-        await ctx.send(f"❌ Couldn't connect to the voice channel: {e}")
-        return
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
 
-    await ctx.send(f'🔎 Searching for: **{query}**')
+        state = bot.get_state(ctx.guild.id)
 
-    # Run yt-dlp in a background thread so the bot doesn't freeze
-    try:
-        loop = asyncio.get_event_loop()
-        song_info = await loop.run_in_executor(
-            None, functools.partial(search_youtube, query)
-        )
+        query = query.strip()
 
-        if song_info is None:
-            await ctx.send("❌ No results found for that search.")
-            return
+        if not query:
+            return await ctx.send('❌ You need to tell me what to play! Example: `!play lofi beats`')
 
-        song_info['requester'] = ctx.author.display_name
+        state.text_channel = ctx.channel
 
-    except Exception as e:
-        await ctx.send("❌ Couldn't find or load that song. Try a different search.")
-        logger.error(f'yt-dlp error: {e}')
-        return
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            return await ctx.send('❌ You need to be in a voice channel!')
 
-    # If something is already playing, add to queue
-    if state.voice_client.is_playing() or state.voice_client.is_paused():
-        state.queue.append(song_info)
-        position = len(state.queue)
-        await ctx.send(
-            f'📋 Added to queue (#{position}): **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
-        )
-    else:
-        # Nothing is playing, start immediately
-        state.current_song = song_info
+        voice_channel = ctx.author.voice.channel
+
         bot.cancel_idle_timer(ctx.guild.id)
+        bot.cancel_alone_timer(ctx.guild.id)
+
+        try:
+            if state.voice_client is None or not state.voice_client.is_connected():
+                state.voice_client = await voice_channel.connect()
+            elif state.voice_client.channel != voice_channel:
+                await state.voice_client.move_to(voice_channel)
+
+        except Exception as e:
+            logger.exception(f'Voice connection error: {e}')
+            return await ctx.send(f"❌ Couldn't connect to the voice channel: {e}")
+
+        await ctx.send(f'🔎 Searching for: **{query}**')
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            song_info = await loop.run_in_executor(
+                None,
+                functools.partial(search_youtube, query)
+            )
+
+            if song_info is None:
+                return await ctx.send('❌ No results found for that search.')
+
+            song_info['requester'] = ctx.author.display_name
+
+        except Exception as e:
+            logger.exception(f'yt-dlp error: {e}')
+            return await ctx.send("❌ Couldn't find or load that song. Try a different search.")
+
+        # Already playing: queue it
+        if state.voice_client.is_playing() or state.voice_client.is_paused():
+            state.queue.append(song_info)
+            position = len(state.queue)
+
+            return await ctx.send(
+                f'📋 Added to queue (#{position}): '
+                f'**{song_info["title"]}** [{format_duration(song_info["duration"])}]'
+            )
+
+        # Nothing playing: start now
+        state.current_song = song_info
+        state.stop_requested = False
+        state.skip_requested = False
+
         try:
             source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
             source = discord.PCMVolumeTransformer(source, volume=state.volume)
-            state.voice_client.play(source, after=lambda e: bot.play_next(ctx.guild.id, e))
+
+            state.voice_client.play(
+                source,
+                after=lambda e: bot.play_next(ctx.guild.id, e)
+            )
+
             await ctx.send(
                 f'🎵 Now playing: **{song_info["title"]}** [{format_duration(song_info["duration"])}]'
             )
+
         except Exception as e:
-            await ctx.send("❌ Error playing that song. Try again or try a different one.")
-            logger.error(f'Playback error: {e}')
+            logger.exception(f'Playback error: {e}')
             state.current_song = None
+            await ctx.send('❌ Error playing that song. Try again or try a different one.')
+
+    except Exception as e:
+        logger.exception(f'play command error: {e}')
+        await ctx.send('❌ Unexpected error in play command.')
 
 
-# --- !np (now playing) command ---
 @bot.command(name='np')
 async def now_playing(ctx):
     """Show details about the song currently playing."""
-    state = bot.get_state(ctx.guild.id)
-    if state.current_song is None:
-        await ctx.send('Nothing is playing right now.')
-    else:
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.current_song is None:
+            return await ctx.send('Nothing is playing right now.')
+
         song = state.current_song
+
         loop_status = ''
+
         if state.loop_mode == 'song':
             loop_status = '\n🔂 **Loop:** Song'
         elif state.loop_mode == 'queue':
             loop_status = '\n🔁 **Loop:** Queue'
 
-        np_text = (
+        await ctx.send(
             f'🎵 **Now Playing**\n'
             f'**Title:** {song["title"]}\n'
             f'**Duration:** {format_duration(song["duration"])}\n'
             f'**Requested by:** {song["requester"]}'
             f'{loop_status}'
         )
-        await ctx.send(np_text)
+
+    except Exception as e:
+        logger.exception(f'np command error: {e}')
+        await ctx.send('❌ Could not show now playing.')
 
 
-# --- !loop command ---
 @bot.command(name='loop')
 async def loop_cmd(ctx, *, arg: str = ''):
     """Set loop mode: song, queue, or off. No argument shows current status."""
-    state = bot.get_state(ctx.guild.id)
-    arg = arg.strip().lower()
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
 
-    if arg == 'song':
-        state.loop_mode = 'song'
-        await ctx.send('🔂 Looping the **current song**.')
-    elif arg == 'queue':
-        state.loop_mode = 'queue'
-        await ctx.send('🔁 Looping the **entire queue**.')
-    elif arg == 'off':
-        state.loop_mode = 'off'
-        await ctx.send('➡️ Loop is now **off**.')
-    else:
-        await ctx.send(
-            f'Current loop mode: **{state.loop_mode}**\n'
-            f'Usage: `!loop song` / `!loop queue` / `!loop off`'
-        )
+        state = bot.get_state(ctx.guild.id)
+
+        arg = arg.strip().lower()
+
+        if arg == 'song':
+            state.loop_mode = 'song'
+            await ctx.send('🔂 Looping the **current song**.')
+        elif arg == 'queue':
+            state.loop_mode = 'queue'
+            await ctx.send('🔁 Looping the **entire queue**.')
+        elif arg == 'off':
+            state.loop_mode = 'off'
+            await ctx.send('➡️ Loop is now **off**.')
+        else:
+            await ctx.send(
+                f'Current loop mode: **{state.loop_mode}**\n'
+                f'Usage: `!loop song` / `!loop queue` / `!loop off`'
+            )
+
+    except Exception as e:
+        logger.exception(f'loop command error: {e}')
+        await ctx.send('❌ Could not update loop mode.')
 
 
-# --- !skip command ---
 @bot.command(name='skip')
 async def skip(ctx):
     """Skip to the next song in the queue."""
-    state = bot.get_state(ctx.guild.id)
-    if state.voice_client and state.voice_client.is_playing():
-        state.voice_client.stop()  # Stopping triggers play_next via the "after" callback
-        # Brief pause so discord.py's voice client has time to fully release the
-        # current audio source before the after-callback's play_next attempts to
-        # start the next one. Without this, voice_client.play() inside play_next
-        # races the cleanup from stop() and fails silently — the message goes
-        # through but the queued song never starts.
-        await asyncio.sleep(0.5)
-        await ctx.send('⏭️ Skipped!')
-    else:
-        await ctx.send('Nothing is playing.')
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.skip_requested = True
+            state.current_song = None
+            state.voice_client.stop()
+            await ctx.send('⏭️ Skipped!')
+        else:
+            await ctx.send('Nothing is playing.')
+
+    except Exception as e:
+        logger.exception(f'skip command error: {e}')
+        await ctx.send('❌ Could not skip.')
 
 
-# --- !queue command ---
 @bot.command(name='queue')
 async def queue_cmd(ctx):
     """Show the current song and upcoming queue."""
-    state = bot.get_state(ctx.guild.id)
-    if state.current_song is None and len(state.queue) == 0:
-        await ctx.send('The queue is empty.')
-        return
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
 
-    queue_text = ''
+        state = bot.get_state(ctx.guild.id)
 
-    if state.current_song:
-        queue_text += (
-            f'🎵 **Now playing:** {state.current_song["title"]} '
-            f'[{format_duration(state.current_song["duration"])}] '
-            f'(requested by {state.current_song["requester"]})\n\n'
-        )
+        if state.current_song is None and len(state.queue) == 0:
+            return await ctx.send('The queue is empty.')
 
-    if len(state.queue) > 0:
-        queue_text += '**Up next:**\n'
-        # Only show first 15 songs to avoid hitting Discord's message limit
-        for i, song in enumerate(list(state.queue)[:15], 1):
-            queue_text += f'{i}. {song["title"]} [{format_duration(song["duration"])}] (requested by {song["requester"]})\n'
+        queue_text = ''
 
-        if len(state.queue) > 15:
-            queue_text += f'\n*...and {len(state.queue) - 15} more songs.*'
-    else:
-        queue_text += '*No more songs in queue.*'
+        if state.current_song:
+            queue_text += (
+                f'🎵 **Now playing:** {state.current_song["title"]} '
+                f'[{format_duration(state.current_song["duration"])}] '
+                f'(requested by {state.current_song["requester"]})\n\n'
+            )
 
-    await ctx.send(queue_text)
+        if len(state.queue) > 0:
+            queue_text += '**Up next:**\n'
+
+            for i, song in enumerate(list(state.queue)[:15], 1):
+                queue_text += (
+                    f'{i}. {song["title"]} '
+                    f'[{format_duration(song["duration"])}] '
+                    f'(requested by {song["requester"]})\n'
+                )
+
+            if len(state.queue) > 15:
+                queue_text += f'\n*...and {len(state.queue) - 15} more songs.*'
+        else:
+            queue_text += '*No more songs in queue.*'
+
+        await ctx.send(queue_text)
+
+    except Exception as e:
+        logger.exception(f'queue command error: {e}')
+        await ctx.send('❌ Could not show queue.')
 
 
-# --- !stop command ---
 @bot.command(name='stop')
 async def stop(ctx):
     """Stop playback and clear the queue."""
-    state = bot.get_state(ctx.guild.id)
-    if state.voice_client:
-        state.queue.clear()
-        state.current_song = None
-        state.voice_client.stop()
-        await ctx.send('⏹️ Stopped and cleared the queue.')
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.voice_client:
+            state.stop_requested = True
+            state.queue.clear()
+            state.current_song = None
+
+            if state.voice_client.is_playing() or state.voice_client.is_paused():
+                state.voice_client.stop()
+
+            bot.start_idle_timer(ctx.guild.id)
+
+            await ctx.send('⏹️ Stopped and cleared the queue.')
+        else:
+            await ctx.send('Nothing is playing.')
+
+    except Exception as e:
+        logger.exception(f'stop command error: {e}')
+        await ctx.send('❌ Could not stop playback.')
 
 
-# --- !pause command ---
 @bot.command(name='pause')
 async def pause(ctx):
     """Pause the current song."""
-    state = bot.get_state(ctx.guild.id)
-    if state.voice_client and state.voice_client.is_playing():
-        state.voice_client.pause()
-        await ctx.send('⏸️ Paused.')
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.voice_client and state.voice_client.is_playing():
+            state.voice_client.pause()
+            await ctx.send('⏸️ Paused.')
+        else:
+            await ctx.send('Nothing is playing.')
+
+    except Exception as e:
+        logger.exception(f'pause command error: {e}')
+        await ctx.send('❌ Could not pause.')
 
 
-# --- !resume command ---
 @bot.command(name='resume')
 async def resume(ctx):
     """Resume a paused song."""
-    state = bot.get_state(ctx.guild.id)
-    if state.voice_client and state.voice_client.is_paused():
-        state.voice_client.resume()
-        await ctx.send('▶️ Resumed.')
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.voice_client and state.voice_client.is_paused():
+            state.voice_client.resume()
+            await ctx.send('▶️ Resumed.')
+        else:
+            await ctx.send('Nothing is paused.')
+
+    except Exception as e:
+        logger.exception(f'resume command error: {e}')
+        await ctx.send('❌ Could not resume.')
 
 
-# --- !leave command ---
 @bot.command(name='leave')
 async def leave(ctx):
     """Disconnect the bot from voice and clear the queue."""
-    state = bot.get_state(ctx.guild.id)
-    if state.voice_client and state.voice_client.is_connected():
-        state.queue.clear()
-        state.current_song = None
-        await state.voice_client.disconnect()
-        state.voice_client = None
-        await ctx.send('👋 Left the voice channel.')
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if state.voice_client and state.voice_client.is_connected():
+            state.stop_requested = True
+            state.queue.clear()
+            state.current_song = None
+
+            bot.cancel_idle_timer(ctx.guild.id)
+            bot.cancel_alone_timer(ctx.guild.id)
+
+            if state.voice_client.is_playing() or state.voice_client.is_paused():
+                state.voice_client.stop()
+
+            await state.voice_client.disconnect(force=True)
+            state.voice_client = None
+
+            await ctx.send('👋 Left the voice channel.')
+        else:
+            await ctx.send('I am not connected to a voice channel.')
+
+    except Exception as e:
+        logger.exception(f'leave command error: {e}')
+        await ctx.send('❌ Could not leave voice channel.')
 
 
-# --- !help command ---
+@bot.command(name='shuffle')
+async def shuffle(ctx):
+    """Randomize the order of songs in the queue."""
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        if len(state.queue) < 2:
+            return await ctx.send('Not enough songs in the queue to shuffle.')
+
+        queue_list = list(state.queue)
+        random.shuffle(queue_list)
+        state.queue = deque(queue_list)
+
+        await ctx.send(f'🔀 Shuffled {len(state.queue)} songs in the queue.')
+
+    except Exception as e:
+        logger.exception(f'shuffle command error: {e}')
+        await ctx.send('❌ Could not shuffle queue.')
+
+
+@bot.command(name='volume')
+async def volume_cmd(ctx, *, arg: str = ''):
+    """Set the playback volume 0-100. No argument shows current volume."""
+    try:
+        if not ctx.guild:
+            return await ctx.send('❌ This command can only be used inside a server.')
+
+        state = bot.get_state(ctx.guild.id)
+
+        arg = arg.strip()
+
+        if not arg:
+            return await ctx.send(f'🔊 Current volume: **{int(state.volume * 100)}%**')
+
+        try:
+            vol = int(arg)
+        except ValueError:
+            return await ctx.send('Use a number between 0 and 100. Example: `!volume 50`')
+
+        if vol < 0 or vol > 100:
+            return await ctx.send('Volume must be between 0 and 100.')
+
+        state.volume = vol / 100
+
+        if state.voice_client and state.voice_client.source:
+            state.voice_client.source.volume = state.volume
+
+        await ctx.send(f'🔊 Volume set to **{vol}%**')
+
+    except Exception as e:
+        logger.exception(f'volume command error: {e}')
+        await ctx.send('❌ Could not set volume.')
+
+
 @bot.command(name='help')
 async def help_cmd(ctx):
     """Show the list of available commands."""
@@ -473,59 +922,22 @@ async def help_cmd(ctx):
         '`!leave` — Disconnect the bot\n'
         '`!help` — Show this list'
     )
+
     await ctx.send(help_text)
 
 
-# --- !shuffle command ---
-@bot.command(name='shuffle')
-async def shuffle(ctx):
-    """Randomize the order of songs in the queue."""
-    state = bot.get_state(ctx.guild.id)
-    if len(state.queue) < 2:
-        await ctx.send('Not enough songs in the queue to shuffle.')
-        return
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
 
-    # Convert deque to list, shuffle it, convert back
-    queue_list = list(state.queue)
-    random.shuffle(queue_list)
-    state.queue = deque(queue_list)
+def main():
+    token = os.getenv('DISCORD_TOKEN')
 
-    await ctx.send(f'🔀 Shuffled {len(state.queue)} songs in the queue.')
+    if not token:
+        raise RuntimeError('DISCORD_TOKEN is missing. Add it to your .env file.')
+
+    bot.run(token)
 
 
-# --- !volume command ---
-@bot.command(name='volume')
-async def volume_cmd(ctx, *, arg: str = ''):
-    """Set the playback volume (0-100). No argument shows current volume."""
-    state = bot.get_state(ctx.guild.id)
-    arg = arg.strip()
-
-    # No argument — show current volume
-    if not arg:
-        await ctx.send(f'🔊 Current volume: **{int(state.volume * 100)}%**')
-        return
-
-    # Try to parse the number
-    try:
-        vol = int(arg)
-    except ValueError:
-        await ctx.send('Use a number between 0 and 100. Example: `!volume 50`')
-        return
-
-    # Clamp between 0 and 100
-    if vol < 0 or vol > 100:
-        await ctx.send('Volume must be between 0 and 100.')
-        return
-
-    # Set the volume (convert 0-100 to 0.0-1.0)
-    state.volume = vol / 100
-
-    # Apply to currently playing audio immediately
-    if state.voice_client and state.voice_client.source:
-        state.voice_client.source.volume = state.volume
-
-    await ctx.send(f'🔊 Volume set to **{vol}%**')
-
-
-# Run the bot
-bot.run(os.getenv('DISCORD_TOKEN'))
+if __name__ == '__main__':
+    main()
